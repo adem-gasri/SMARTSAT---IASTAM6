@@ -31,39 +31,39 @@
       256
     ]
   ],
-  "raw_detections": 3,
+  "raw_detections": 2,
   "deduped_detections": 2,
-  "payload_bytes": 69760,
+  "payload_bytes": 16512,
   "raw_image_bytes": 1769472,
-  "data_reduction_pct": 96.06,
+  "data_reduction_pct": 99.07,
   "stage_times_s": {
-    "tiling": 4e-05,
-    "detection": 6.373597,
-    "spatial_dedup": 2.7e-05,
-    "payload_sizing": 1e-05
+    "tiling": 2.1e-05,
+    "detection": 5.468995,
+    "spatial_dedup": 2.4e-05,
+    "payload_sizing": 1.1e-05
   },
   "detections": [
     {
       "bbox_xyxy": [
-        539.8,
-        203.4,
-        673.4,
-        354.6
+        538.6,
+        202.5,
+        674.1,
+        354.4
       ],
-      "confidence": 0.694,
+      "confidence": 0.685,
       "tier": "uncertain",
       "payload_bytes": 8256
     },
     {
       "bbox_xyxy": [
-        538.5,
-        182.9,
-        639.6,
-        209.7
+        535.0,
+        181.2,
+        639.2,
+        210.1
       ],
-      "confidence": 0.265,
-      "tier": "highly_uncertain",
-      "payload_bytes": 61504
+      "confidence": 0.537,
+      "tier": "uncertain",
+      "payload_bytes": 8256
     }
   ]
 }

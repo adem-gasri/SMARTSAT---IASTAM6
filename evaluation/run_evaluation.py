@@ -37,12 +37,11 @@ RESULTS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 # (30 epochs, 3000-image subset, Airbus Ship Detection). Replace with the
 # latest numbers once the model is retrained on more data.
 DETECTION_METRICS = {
-    "precision": 0.733,
-    "recall": 0.606,
-    "mAP50": 0.686,
-    "mAP50_95": 0.415,
+    "precision": 0.818,
+    "recall": 0.701,
+    "mAP50": 0.782,
+    "mAP50_95": 0.510,
 }
-
 
 def run():
     stage_times = {}
