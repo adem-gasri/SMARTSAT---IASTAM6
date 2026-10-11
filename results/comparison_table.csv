@@ -1,0 +1,11 @@
+Metric,Baseline 1 (Raw),Baseline 2 (Detection-only),Proposed System
+Data volume (bytes),79626240,448,33088
+Data reduction rate vs Baseline 1,0%,-,99.96%
+Data reduction rate vs Baseline 2,-,0%,-7285.71%
+Precision,N/A,0.733,0.733
+Recall,N/A,0.606,0.606
+mAP50,N/A,0.686,0.686
+False merging rate,N/A,N/A,0.00%
+Missed update rate,N/A,N/A,0.00%
+AIS mismatch rate,N/A,N/A,0.00%
+Total latency (s),-,-,0.0001
