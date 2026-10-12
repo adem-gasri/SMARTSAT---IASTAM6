@@ -1,0 +1,21 @@
+{
+  "tag": "tile640_sweep",
+  "num_images": 35,
+  "tile_size": 640,
+  "overlap_argument": 0.2,
+  "confidence_threshold": 0.05,
+  "iou_threshold": 0.5,
+  "TP": 43,
+  "FP": 82,
+  "FN": 10,
+  "precision": 0.344,
+  "recall": 0.811321,
+  "f1_score": 0.483146,
+  "mean_inference_seconds_per_image": 0.146498,
+  "total_jpeg_bytes": 6047704,
+  "total_raw_rgb_bytes": 61931520,
+  "estimated_payload_bytes": 6135616,
+  "reduction_vs_jpeg_percent": -1.4536,
+  "reduction_vs_raw_percent": 90.0929,
+  "payload_note": "Estimated payload: 64-byte metadata, 8-KiB ROI, 60-KiB crop. Not actual network traffic."
+}

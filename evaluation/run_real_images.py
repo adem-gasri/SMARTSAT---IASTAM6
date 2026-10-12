@@ -1,239 +1,415 @@
-"""
-evaluation/run_real_images.py
 
-Runs the SmartSat pipeline (tiling + YOLO + NMS + confidence-aware payload)
-on a folder of CLEAN validation images and compares the transmission
-strategies on REAL detections, against the ground-truth annotations.
-
-Payload sizes are MEASURED: every transmitted crop is really cropped from
-the image and JPEG-encoded in memory (the old fixed sizes are kept as
-"modeled" values for comparison).
-
-Usage:
-    python evaluation/run_real_images.py --images detection/test_images/images --labels detection/test_images/labels --weights detection/models/best_v2.pt --tile-size 768
-"""
-
-import argparse
-import csv
-import io
-import json
 import os
-import sys
+import csv
+import json
 import time
+import argparse
+from pathlib import Path
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(ROOT)
-
-from spatial_dedup.tiling import generate_tiles, tile_box_to_global      # noqa: E402
-from spatial_dedup.nms_merge import nms_merge, iou                       # noqa: E402
-from evaluation.baselines import (                                       # noqa: E402
-    METADATA_SIZE_BYTES, confidence_tier, payload_size_for_detection,
-)
-
-IMG_EXTS = (".jpg", ".jpeg", ".png")
-TIERS = ["high_confidence", "uncertain", "highly_uncertain"]
+from ultralytics import YOLO
 
 
-def load_gt_boxes(label_path, img_w, img_h):
-    """Read a YOLO label file and return boxes as [x1, y1, x2, y2] in pixels."""
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+
+METADATA_BYTES = 64
+SMALL_ROI_BYTES = 8 * 1024
+FULL_CROP_BYTES = 60 * 1024
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="SmartSat real-image evaluation"
+    )
+
+    parser.add_argument("--images", required=True)
+    parser.add_argument("--labels", required=True)
+    parser.add_argument("--weights", required=True)
+    parser.add_argument("--tile-size", type=int, default=640)
+    parser.add_argument("--overlap", type=float, default=0.20)
+    parser.add_argument("--conf", type=float, default=0.05)
+    parser.add_argument("--tag", default="real_images")
+    parser.add_argument("--iou", type=float, default=0.50)
+    parser.add_argument("--high-thr", type=float, default=0.75)
+    parser.add_argument("--low-thr", type=float, default=0.45)
+
+    return parser.parse_args()
+
+
+def read_labels(label_path, image_width, image_height):
+    """Read ground-truth boxes in YOLO normalized format."""
     boxes = []
-    if not label_path or not os.path.exists(label_path):
+
+    if not os.path.isfile(label_path):
         return boxes
-    with open(label_path) as f:
-        for line in f:
-            parts = line.split()
+
+    with open(label_path, "r", encoding="utf-8") as file:
+        for line in file:
+            parts = line.strip().split()
+
             if len(parts) < 5:
                 continue
-            _, xc, yc, w, h = map(float, parts[:5])
-            boxes.append([(xc - w / 2) * img_w, (yc - h / 2) * img_h,
-                          (xc + w / 2) * img_w, (yc + h / 2) * img_h])
+
+            try:
+                xc, yc, width, height = map(float, parts[1:5])
+            except ValueError:
+                continue
+
+            x1 = (xc - width / 2) * image_width
+            y1 = (yc - height / 2) * image_height
+            x2 = (xc + width / 2) * image_width
+            y2 = (yc + height / 2) * image_height
+
+            boxes.append([x1, y1, x2, y2])
+
     return boxes
 
 
-def match_flags(detections, gt_boxes, iou_thr=0.5):
-    """Greedy one-to-one matching, highest confidence first.
-    Returns a list of booleans (True = true positive) aligned with `detections`."""
-    order = sorted(range(len(detections)), key=lambda i: detections[i]["confidence"], reverse=True)
-    used, flags = set(), [False] * len(detections)
-    for i in order:
-        best_j, best_iou = None, iou_thr
-        for j, g in enumerate(gt_boxes):
-            if j in used:
+def calculate_iou(box_a, box_b):
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+
+    intersection = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+    area_a = max(0, ax2 - ax1) * max(0, ay2 - ay1)
+    area_b = max(0, bx2 - bx1) * max(0, by2 - by1)
+
+    union = area_a + area_b - intersection
+
+    if union <= 0:
+        return 0.0
+
+    return intersection / union
+
+
+def get_tier(confidence, high_thr, low_thr):
+    if confidence >= high_thr:
+        return "high"
+    elif confidence >= low_thr:
+        return "uncertain"
+    else:
+        return "highly_uncertain"
+
+
+def calculate_payload(tier):
+    if tier == "high":
+        return METADATA_BYTES, 0, 0
+
+    elif tier == "uncertain":
+        return METADATA_BYTES + SMALL_ROI_BYTES, SMALL_ROI_BYTES, 0
+
+    else:
+        return METADATA_BYTES + FULL_CROP_BYTES, 0, FULL_CROP_BYTES
+
+
+def match_detections(predictions, ground_truth, iou_threshold):
+    """Match predictions to ground truth, with each GT used once."""
+    used_gt = set()
+    tp = 0
+    fp = 0
+
+    predictions.sort(
+        key=lambda prediction: prediction["confidence"],
+        reverse=True
+    )
+
+    for prediction in predictions:
+        best_iou = 0
+        best_index = None
+
+        for index, gt_box in enumerate(ground_truth):
+            if index in used_gt:
                 continue
-            v = iou(detections[i]["bbox_xyxy"], g)
-            if v >= best_iou:
-                best_iou, best_j = v, j
-        if best_j is not None:
-            used.add(best_j)
-            flags[i] = True
-    return flags
+
+            score = calculate_iou(
+                prediction["bbox_xyxy"],
+                gt_box
+            )
+
+            if score > best_iou:
+                best_iou = score
+                best_index = index
+
+        if best_index is not None and best_iou >= iou_threshold:
+            tp += 1
+            used_gt.add(best_index)
+            prediction["true_positive"] = True
+        else:
+            fp += 1
+            prediction["true_positive"] = False
+
+    fn = len(ground_truth) - len(used_gt)
+
+    return tp, fp, fn
 
 
-def covered_gt(detections, gt_boxes, iou_thr=0.5):
-    """Number of true ships overlapped (IoU >= thr) by at least one detection."""
-    return sum(1 for g in gt_boxes if any(iou(d["bbox_xyxy"], g) >= iou_thr for d in detections))
+def safe_divide(a, b):
+    return a / b if b != 0 else 0.0
 
 
-def crop_with_margin(img, bbox, margin=0.2, min_side=4):
-    """Crop the detection box plus a 20% margin, clamped to the image."""
-    x1, y1, x2, y2 = bbox
-    mw, mh = (x2 - x1) * margin, (y2 - y1) * margin
-    left, top = max(0, int(x1 - mw)), max(0, int(y1 - mh))
-    right, bottom = min(img.width, int(x2 + mw) + 1), min(img.height, int(y2 + mh) + 1)
-    right, bottom = max(right, min(img.width, left + min_side)), max(bottom, min(img.height, top + min_side))
-    return img.crop((left, top, right, bottom))
+def main():
+    args = parse_args()
 
+    images_dir = Path(args.images)
+    labels_dir = Path(args.labels)
+    weights_path = Path(args.weights)
 
-def jpeg_size(pil_img, quality):
-    buf = io.BytesIO()
-    pil_img.save(buf, format="JPEG", quality=quality)
-    return buf.tell()
+    if not images_dir.is_dir():
+        raise SystemExit(f"Images folder not found: {images_dir}")
 
+    if not labels_dir.is_dir():
+        raise SystemExit(f"Labels folder not found: {labels_dir}")
 
-def process_image(path, detector, tile_size, overlap):
-    """Same chain as pipeline.run_pipeline, with measured payload sizes."""
-    from PIL import Image
-    img = Image.open(path).convert("RGB")
-    w, h = img.size
-    tiles = generate_tiles(w, h, tile_size=tile_size, overlap_ratio=overlap)
-    t0 = time.perf_counter()
-    raw = []
-    for t in tiles:
-        crop = img.crop((t.x_offset, t.y_offset, t.x_offset + t.width, t.y_offset + t.height))
-        for d in detector.predict(crop):
-            raw.append({"bbox_xyxy": tile_box_to_global(d.bbox_xyxy, t), "confidence": d.confidence})
-    det_time = time.perf_counter() - t0
+    if not weights_path.is_file():
+        raise SystemExit(f"Model not found: {weights_path}")
 
-    deduped = nms_merge(raw, iou_threshold=0.4)
-    for d in deduped:
-        d["tier"] = confidence_tier(d["confidence"])
-        crop = crop_with_margin(img, d["bbox_xyxy"])
-        small = crop.copy()
-        small.thumbnail((64, 64))                                   # low-resolution ROI
-        d["bytes_small_roi"] = METADATA_SIZE_BYTES + jpeg_size(small, 60)
-        d["bytes_full_crop"] = METADATA_SIZE_BYTES + jpeg_size(crop, 90)   # native-resolution crop
-        d["payload_bytes"] = {"high_confidence": METADATA_SIZE_BYTES,
-                              "uncertain": d["bytes_small_roi"],
-                              "highly_uncertain": d["bytes_full_crop"]}[d["tier"]]
-        d["payload_bytes_modeled"] = payload_size_for_detection(d["confidence"])
-    return w, h, len(tiles), raw, deduped, det_time
+    image_paths = sorted(
+        path for path in images_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in IMAGE_EXTENSIONS
+    )
 
+    if not image_paths:
+        raise SystemExit(f"No images found in {images_dir}")
 
-def evaluate_folder(images_dir, labels_dir, detector, out_dir="results",
-                    tile_size=640, overlap=0.20, tag=None):
-    tag = tag or f"tile{tile_size}"
-    files = sorted(f for f in os.listdir(images_dir) if f.lower().endswith(IMG_EXTS))
-    if not files:
-        raise SystemExit(f"Aucune image trouvée dans {images_dir}")
+    output_dir = Path("results")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    rows, det_rows = [], []
-    tier_stats = {t: {"detections": 0, "true_positives": 0, "payload_bytes": 0} for t in TIERS}
+    print("Loading YOLO model...")
+    model = YOLO(str(weights_path))
 
-    for i, f in enumerate(files, 1):
-        path = os.path.join(images_dir, f)
-        w, h, n_tiles, raw, deduped, det_time = process_image(path, detector, tile_size, overlap)
-        label_path = os.path.join(labels_dir, os.path.splitext(f)[0] + ".txt") if labels_dir else None
-        gt = load_gt_boxes(label_path, w, h)
+    det_rows = []
+    image_rows = []
+    gt_by_image = {}
 
-        flags = match_flags(deduped, gt) if labels_dir else [False] * len(deduped)
-        tp = sum(flags)
-        fp, fn = len(deduped) - tp, len(gt) - tp
-        lost = (covered_gt(raw, gt) - covered_gt(deduped, gt)) if labels_dir else 0
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
 
-        for d, ok in zip(deduped, flags):
-            ts = tier_stats[d["tier"]]
-            ts["detections"] += 1
-            ts["true_positives"] += int(ok)
-            ts["payload_bytes"] += d["payload_bytes"]
-            det_rows.append({"image": f, "confidence": round(d["confidence"], 4), "tier": d["tier"],
-                             "true_positive": int(ok), "bytes_small_roi": d["bytes_small_roi"],
-                             "bytes_full_crop": d["bytes_full_crop"], "payload_bytes": d["payload_bytes"]})
+    total_jpeg_bytes = 0
+    total_raw_bytes = 0
+    total_payload_bytes = 0
+    total_inference_time = 0.0
 
-        rows.append({
-            "image": f, "n_ships_truth": len(gt), "tiles": n_tiles,
-            "raw_detections": len(raw), "deduped_detections": len(deduped),
-            "tp": tp, "fp": fp, "fn": fn, "ships_lost_by_dedup": lost,
-            "payload_bytes": sum(d["payload_bytes"] for d in deduped),
-            "payload_bytes_modeled": sum(d["payload_bytes_modeled"] for d in deduped),
-            "raw_uncompressed_bytes": w * h * 3,
-            "jpeg_bytes": os.path.getsize(path),
-            "detection_time_s": round(det_time, 4),
+    for number, image_path in enumerate(image_paths, start=1):
+        print(f"[{number}/{len(image_paths)}] {image_path.name}")
+
+        start = time.perf_counter()
+
+        results = model.predict(
+            source=str(image_path),
+            imgsz=args.tile_size,
+            conf=args.conf,
+            verbose=False
+        )
+
+        inference_time = time.perf_counter() - start
+        total_inference_time += inference_time
+
+        result = results[0]
+        image_height, image_width = result.orig_shape
+
+        label_path = labels_dir / f"{image_path.stem}.txt"
+
+        gt_boxes = read_labels(
+            str(label_path),
+            image_width,
+            image_height
+        )
+
+        gt_by_image[image_path.name] = gt_boxes
+
+        predictions = []
+
+        if result.boxes is not None:
+            for box in result.boxes:
+                coordinates = [
+                    float(value)
+                    for value in box.xyxy[0].tolist()
+                ]
+
+                confidence = float(box.conf[0].item())
+
+                predictions.append({
+                    "image": image_path.name,
+                    "confidence": confidence,
+                    "bbox_xyxy": coordinates
+                })
+
+        tp, fp, fn = match_detections(
+            predictions,
+            gt_boxes,
+            args.iou
+        )
+
+        total_tp += tp
+        total_fp += fp
+        total_fn += fn
+
+        jpeg_bytes = image_path.stat().st_size
+        raw_bytes = image_width * image_height * 3
+
+        total_jpeg_bytes += jpeg_bytes
+        total_raw_bytes += raw_bytes
+
+        image_payload = 0
+
+        for prediction in predictions:
+            confidence = prediction["confidence"]
+
+            tier = get_tier(
+                confidence,
+                args.high_thr,
+                args.low_thr
+            )
+
+            payload, small_roi, full_crop = calculate_payload(tier)
+            image_payload += payload
+
+            x1, y1, x2, y2 = prediction["bbox_xyxy"]
+
+            det_rows.append({
+                "image": image_path.name,
+                "confidence": round(confidence, 6),
+                "tier": tier,
+                "x1": round(x1, 2),
+                "y1": round(y1, 2),
+                "x2": round(x2, 2),
+                "y2": round(y2, 2),
+                "true_positive": prediction["true_positive"],
+                "bytes_small_roi": small_roi,
+                "bytes_full_crop": full_crop,
+                "payload_bytes": payload
+            })
+
+        total_payload_bytes += image_payload
+
+        image_rows.append({
+            "image": image_path.name,
+            "image_bytes_jpeg": jpeg_bytes,
+            "image_bytes_raw_rgb": raw_bytes,
+            "ground_truth": len(gt_boxes),
+            "detections": len(predictions),
+            "TP": tp,
+            "FP": fp,
+            "FN": fn,
+            "precision": round(safe_divide(tp, tp + fp), 6),
+            "recall": round(safe_divide(tp, tp + fn), 6),
+            "payload_bytes_estimated": image_payload,
+            "inference_seconds": round(inference_time, 6)
         })
-        print(f"[{i}/{len(files)}] {f}: truth {len(gt)} | raw {len(raw)} -> dedup {len(deduped)} | "
-              f"TP {tp} FP {fp} FN {fn} | lost by dedup {lost}")
 
-    n = len(rows)
-    s = lambda k: sum(x[k] for x in rows)
-    proposed, raw_unc, jpeg = s("payload_bytes"), s("raw_uncompressed_bytes"), s("jpeg_bytes")
-    baseline2 = s("raw_detections") * METADATA_SIZE_BYTES
-    metadata_part = s("deduped_detections") * METADATA_SIZE_BYTES
-    tp, fp, fn = s("tp"), s("fp"), s("fn")
+    precision = safe_divide(total_tp, total_tp + total_fp)
+    recall = safe_divide(total_tp, total_tp + total_fn)
+    f1 = safe_divide(
+        2 * precision * recall,
+        precision + recall
+    )
 
     summary = {
-        "tile_size": tile_size, "overlap": overlap,
-        "n_images": n,
-        "n_images_with_ships": sum(1 for x in rows if x["n_ships_truth"] > 0),
-        "n_ships_truth": tp + fn,
-        "bytes": {
-            "baseline_1_raw_uncompressed": raw_unc,
-            "baseline_1_jpeg_files": jpeg,
-            "baseline_2_metadata_per_raw_detection": baseline2,
-            "proposed_measured": proposed,
-            "proposed_modeled_fixed_sizes": s("payload_bytes_modeled"),
-            "proposed_metadata_part": metadata_part,
-            "proposed_crop_part": proposed - metadata_part,
-        },
-        "data_reduction_pct": {
-            "vs_raw_uncompressed": round((1 - proposed / raw_unc) * 100, 2),
-            "vs_jpeg_files": round((1 - proposed / jpeg) * 100, 2),
-            "vs_baseline_2": round((1 - proposed / baseline2) * 100, 2) if baseline2 else None,
-        },
-        "pipeline_detection_quality": None if not labels_dir else {
-            "true_positives": tp, "false_positives": fp, "false_negatives": fn,
-            "precision": round(tp / (tp + fp), 3) if tp + fp else None,
-            "recall": round(tp / (tp + fn), 3) if tp + fn else None,
-            "ships_lost_by_dedup": s("ships_lost_by_dedup"),
-            "false_positives_on_empty_images": sum(x["fp"] for x in rows if x["n_ships_truth"] == 0),
-        },
-        "per_tier": {t: {**v, "precision": round(v["true_positives"] / v["detections"], 3)
-                         if v["detections"] else None} for t, v in tier_stats.items()},
-        "mean_detection_time_per_image_s": round(s("detection_time_s") / n, 3),
+        "tag": args.tag,
+        "num_images": len(image_paths),
+        "tile_size": args.tile_size,
+        "overlap_argument": args.overlap,
+        "confidence_threshold": args.conf,
+        "iou_threshold": args.iou,
+        "TP": total_tp,
+        "FP": total_fp,
+        "FN": total_fn,
+        "precision": round(precision, 6),
+        "recall": round(recall, 6),
+        "f1_score": round(f1, 6),
+        "mean_inference_seconds_per_image": round(
+            total_inference_time / len(image_paths), 6
+        ),
+        "total_jpeg_bytes": total_jpeg_bytes,
+        "total_raw_rgb_bytes": total_raw_bytes,
+        "estimated_payload_bytes": total_payload_bytes,
+        "reduction_vs_jpeg_percent": round(
+            (1 - total_payload_bytes / total_jpeg_bytes) * 100, 4
+        ) if total_jpeg_bytes else 0,
+        "reduction_vs_raw_percent": round(
+            (1 - total_payload_bytes / total_raw_bytes) * 100, 4
+        ) if total_raw_bytes else 0,
+        "payload_note": (
+            "Estimated payload: 64-byte metadata, 8-KiB ROI, "
+            "60-KiB crop. Not actual network traffic."
+        )
     }
 
-    os.makedirs(out_dir, exist_ok=True)
-    json_path = os.path.join(out_dir, f"real_images_results_{tag}.json")
-    csv_path = os.path.join(out_dir, f"real_images_per_image_{tag}.csv")
-    det_path = os.path.join(out_dir, f"real_images_detections_{tag}.csv")
-    with open(json_path, "w") as fh:
-        json.dump(summary, fh, indent=2)
-    with open(csv_path, "w", newline="") as fh:
-        wr = csv.DictWriter(fh, fieldnames=list(rows[0].keys()))
-        wr.writeheader()
-        wr.writerows(rows)
-    with open(det_path, "w", newline="") as fh:
-        wr = csv.DictWriter(fh, fieldnames=["image", "confidence", "tier", "true_positive",
-                                            "bytes_small_roi", "bytes_full_crop", "payload_bytes"])
-        wr.writeheader()
-        wr.writerows(det_rows)
+    detections_csv = output_dir / f"real_images_detections_{args.tag}.csv"
+    per_image_csv = output_dir / f"real_images_per_image_{args.tag}.csv"
+    summary_json = output_dir / f"real_images_summary_{args.tag}.json"
+    ground_truth_json = output_dir / f"real_images_ground_truth_{args.tag}.json"
 
-    print("\n" + "=" * 60)
-    print(json.dumps(summary, indent=2))
-    print(f"\nSauvegardé : {json_path}\n             {csv_path}\n             {det_path}")
-    return summary
+    detection_fields = [
+        "image", "confidence", "tier",
+        "x1", "y1", "x2", "y2",
+        "true_positive",
+        "bytes_small_roi", "bytes_full_crop", "payload_bytes"
+    ]
+
+    with open(detections_csv, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=detection_fields)
+        writer.writeheader()
+        writer.writerows(det_rows)
+
+    image_fields = [
+        "image", "image_bytes_jpeg", "image_bytes_raw_rgb",
+        "ground_truth", "detections", "TP", "FP", "FN",
+        "precision", "recall", "payload_bytes_estimated",
+        "inference_seconds"
+    ]
+
+    with open(per_image_csv, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=image_fields)
+        writer.writeheader()
+        writer.writerows(image_rows)
+
+    with open(summary_json, "w", encoding="utf-8") as file:
+        json.dump(summary, file, indent=2, ensure_ascii=False)
+
+    with open(ground_truth_json, "w", encoding="utf-8") as file:
+        json.dump({
+            "tile_size": args.tile_size,
+            "iou_threshold": args.iou,
+            "ground_truth": gt_by_image
+        }, file, indent=2, ensure_ascii=False)
+
+    print("\n========== SMARTSAT RESULTS ==========")
+    print(f"Images: {len(image_paths)}")
+    print(f"TP: {total_tp}")
+    print(f"FP: {total_fp}")
+    print(f"FN: {total_fn}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall: {recall:.4f}")
+    print(f"F1-score: {f1:.4f}")
+    print(
+        "Mean inference time/image: "
+        f"{total_inference_time / len(image_paths):.4f} s"
+    )
+    print(f"JPEG bytes: {total_jpeg_bytes:,}")
+    print(f"Raw RGB bytes: {total_raw_bytes:,}")
+    print(f"Estimated payload: {total_payload_bytes:,}")
+    print(
+        "Reduction vs JPEG: "
+        f"{summary['reduction_vs_jpeg_percent']:.2f}%"
+    )
+    print(
+        "Reduction vs raw: "
+        f"{summary['reduction_vs_raw_percent']:.2f}%"
+    )
+
+    print("\nFiles saved:")
+    print(detections_csv)
+    print(per_image_csv)
+    print(summary_json)
+    print(ground_truth_json)
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--images", required=True)
-    ap.add_argument("--labels", default=None)
-    ap.add_argument("--weights", default="detection/models/best_v2.pt")
-    ap.add_argument("--out-dir", default="results")
-    ap.add_argument("--tile-size", type=int, default=640, help="768 = pas de découpage sur des images 768x768")
-    ap.add_argument("--overlap", type=float, default=0.20)
-    ap.add_argument("--conf", type=float, default=0.25, help="seuil de confiance du détecteur")
-    ap.add_argument("--tag", default=None, help="suffixe des fichiers de sortie")
-    a = ap.parse_args()
-
-    from detection.detect import ShipDetector
-    evaluate_folder(a.images, a.labels, ShipDetector(a.weights, conf_threshold=a.conf),
-                    a.out_dir, a.tile_size, a.overlap, a.tag)
+    main()
