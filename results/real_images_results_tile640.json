@@ -1,0 +1,51 @@
+{
+  "tile_size": 640,
+  "overlap": 0.2,
+  "n_images": 35,
+  "n_images_with_ships": 25,
+  "n_ships_truth": 53,
+  "bytes": {
+    "baseline_1_raw_uncompressed": 61931520,
+    "baseline_1_jpeg_files": 6047704,
+    "baseline_2_metadata_per_raw_detection": 4800,
+    "proposed_measured": 55950,
+    "proposed_modeled_fixed_sizes": 1408128,
+    "proposed_metadata_part": 3200,
+    "proposed_crop_part": 52750
+  },
+  "data_reduction_pct": {
+    "vs_raw_uncompressed": 99.91,
+    "vs_jpeg_files": 99.07,
+    "vs_baseline_2": -1065.62
+  },
+  "pipeline_detection_quality": {
+    "true_positives": 32,
+    "false_positives": 18,
+    "false_negatives": 21,
+    "precision": 0.64,
+    "recall": 0.604,
+    "ships_lost_by_dedup": 3,
+    "false_positives_on_empty_images": 0
+  },
+  "per_tier": {
+    "high_confidence": {
+      "detections": 15,
+      "true_positives": 14,
+      "payload_bytes": 960,
+      "precision": 0.933
+    },
+    "uncertain": {
+      "detections": 14,
+      "true_positives": 9,
+      "payload_bytes": 13826,
+      "precision": 0.643
+    },
+    "highly_uncertain": {
+      "detections": 21,
+      "true_positives": 9,
+      "payload_bytes": 41164,
+      "precision": 0.429
+    }
+  },
+  "mean_detection_time_per_image_s": 0.216
+}

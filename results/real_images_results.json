@@ -1,0 +1,24 @@
+{
+  "n_images": 35,
+  "n_images_with_ships": 25,
+  "bytes": {
+    "baseline_1_raw_uncompressed": 61931520,
+    "baseline_1_jpeg_files": 6047704,
+    "baseline_2_metadata_per_raw_detection": 4800,
+    "proposed": 1408128
+  },
+  "data_reduction_pct": {
+    "vs_raw_uncompressed": 97.73,
+    "vs_jpeg_files": 76.72,
+    "vs_baseline_2": -29236.0
+  },
+  "pipeline_detection_quality": {
+    "true_positives": 32,
+    "false_positives": 18,
+    "false_negatives": 21,
+    "precision": 0.64,
+    "recall": 0.604,
+    "false_positives_on_empty_images": 0
+  },
+  "mean_detection_time_per_image_s": 0.287
+}

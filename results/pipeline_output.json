@@ -1,5 +1,5 @@
 {
-  "image": "detection_example.jpg",
+  "image": "04b2d8ac7.jpg",
   "image_size": [
     768,
     768
@@ -37,31 +37,31 @@
   "raw_image_bytes": 1769472,
   "data_reduction_pct": 99.07,
   "stage_times_s": {
-    "tiling": 2.1e-05,
-    "detection": 5.468995,
-    "spatial_dedup": 2.4e-05,
-    "payload_sizing": 1.1e-05
+    "tiling": 2.2e-05,
+    "detection": 2.215887,
+    "spatial_dedup": 1.9e-05,
+    "payload_sizing": 8e-06
   },
   "detections": [
     {
       "bbox_xyxy": [
-        538.6,
-        202.5,
-        674.1,
-        354.4
+        292.1,
+        719.8,
+        334.7,
+        745.2
       ],
-      "confidence": 0.685,
+      "confidence": 0.609,
       "tier": "uncertain",
       "payload_bytes": 8256
     },
     {
       "bbox_xyxy": [
-        535.0,
-        181.2,
-        639.2,
-        210.1
+        472.9,
+        266.9,
+        506.1,
+        276.6
       ],
-      "confidence": 0.537,
+      "confidence": 0.468,
       "tier": "uncertain",
       "payload_bytes": 8256
     }
